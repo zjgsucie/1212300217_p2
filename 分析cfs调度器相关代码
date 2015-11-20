@@ -1,0 +1,790 @@
+《Unix系统分析》2015-2016（1）学期大作业
+二、分析内核中cfs调度器相关代码。
+
+此处分析linux 2.6.28版本的kernel 。分析的代码是基于linux-2.6.28- rc7/kernel/ 的sched.c和linux-2.6.28-rc7/kernel/sched_fair.c两个文件。
+（由于Linux内核的分析对于初学者来说，尤其是接触Linux内核不久的人来说，我们在对一些程序代码进行分析时总是需要参考先人做好的一些东西。）
+一: tick中断 
+在tick中断处理函数中,会调用scheduler_tick()函数。该函数的代码如下: 
+void scheduler_tick(void) 
+{ 
+  /*取得当前CPU*/ 
+int cpu = smp_processor_id(); 
+/*取得当前CPU对应的runqueue*/ 
+    struct rq *rq = cpu_rq(cpu); 
+/*当前运行的进程*/ 
+    struct task_struct *curr = rq->curr; 
+ 
+    sched_clock_tick(); 
+ 
+    spin_lock(&rq->lock); 
+    /*更新rq的当前时间戳。即使rq->clock变为当前时间戳*/ 
+    update_rq_clock(rq); 
+    /*更新rq的负载*/ 
+    update_cpu_load(rq); 
+    /*调用调度模块的task_tick函数*/ 
+    curr->sched_class->task_tick(rq, curr, 0); 
+    spin_unlock(&rq->lock); 
+ 
+#ifdef CONFIG_SMP 
+    rq->idle_at_tick = idle_cpu(cpu); 
+    trigger_load_balance(rq, cpu); 
+#endif 
+} 
+从上面的代码中可以看到,经过一部份共同处理之后,流程会转入调度模块的task_tick()函数。 
+其对应CFS的sched_class结构如下: 
+static const struct sched_class fair_sched_class = { 
+    .next           = &idle_sched_class, 
+    .enqueue_task       = enqueue_task_fair, 
+    .dequeue_task       = dequeue_task_fair, 
+    .yield_task     = yield_task_fair, 
+ 
+    .check_preempt_curr = check_preempt_wakeup, 
+ 
+    .pick_next_task     = pick_next_task_fair, 
+    .put_prev_task      = put_prev_task_fair, 
+ 
+#ifdef CONFIG_SMP 
+    .select_task_rq     = select_task_rq_fair, 
+ 
+    .load_balance       = load_balance_fair, 
+    .move_one_task      = move_one_task_fair, 
+#endif 
+ 
+   .set_curr_task          = set_curr_task_fair, 
+    .task_tick      = task_tick_fair, 
+    .task_new       = task_new_fair, 
+ 
+    .prio_changed       = prio_changed_fair, 
+ .switched_to        = switched_to_fair, 
+ 
+#ifdef CONFIG_FAIR_GROUP_SCHED 
+    。moved_group        = moved_group_fair, 
+#endif 
+}; 
+即对应task_tick的处理函数为task_tick_fair()。 代码如下: 
+ 
+static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued) 
+{ 
+    struct cfs_rq *cfs_rq; 
+    struct sched_entity *se = &curr->se; 
+ 
+    /*在没有配置CONFIG_FAIR_GROUP_SCHED时,for_eachsched_entity(se)为 
+*for (; se; se = NULL) 
+*/ 
+    for_each_sched_entity(se) { 
+        /*se所对应的cfs_rq*/ 
+        cfs_rq = cfs_rq_of(se); 
+        entity_tick(cfs_rq, se, queued); 
+    } 
+} 
+在这个函数中,涉及到了两个陌生的数据结构,一个是struct sched_entity,可以将他们理解为调度实体,表示每个可以调度的对象(一般指task)。另外一个是struct cfs_rq。
+以下是CFS的rq。 
+Entity_tick()代码如下: 
+static void 
+entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued) 
+{ 
+    /* 
+     * Update run-time statistics of the 'current'。 
+     */ 
+     /*更新cfs_rq与当前进程的有关信息*/ 
+    update_curr(cfs_rq); 
+ 
+#ifdef CONFIG_SCHED_HRTICK 
+    /* 
+     * queued ticks are scheduled to match the slice, so don't bother 
+     * validating it and just reschedule。 
+     */ 
+    if (queued) { 
+        resched_task(rq_of(cfs_rq)->curr); 
+        return; 
+    } 
+    /* 
+     * don't let the period tick interfere with the hrtick preemption 
+     */ 
+    if (!sched_feat(DOUBLE_TICK) && 
+            hrtimer_active(&rq_of(cfs_rq)->hrtick_timer)) 
+        return; 
+#endif 
+ 
+    /*检查是否要切换出当前进程*/ 
+    if (cfs_rq->nr_running > 1 || !sched_feat(WAKEUP_PREEMPT)) 
+        check_preempt_tick(cfs_rq, curr); 
+} 
+首先,调用update_curr()来更新cfs_rq和当前运行进程的信息,然后再调用check_preempt_tick()来判断是否需要抢占当前进程。 
+ 
+update_curr()代码如下: 
+static void update_curr(struct cfs_rq *cfs_rq) 
+{ 
+    struct sched_entity *curr = cfs_rq->curr; 
+    /*rq_of()用来将cfs_rq转换成它所在的rq*/ 
+    u64 now = rq_of(cfs_rq)->clock; 
+    unsigned long delta_exec; 
+ 
+    if (unlikely(!curr)) 
+        return; 
+ 
+    /* 
+     * Get the amount of time the current task was running 
+     * since the last time we changed load (this cannot 
+     * overflow on 32 bits): 
+     */ 
+     /*自从上次tick中断以来,当前进程运行的时间*/ 
+    delta_exec = (unsigned long)(now - curr->exec_start); 
+ 
+    __update_curr(cfs_rq, curr, delta_exec); 
+    /*更新当前进程的执行时间戳*/ 
+    curr->exec_start = now; 
+ 
+    if (entity_is_task(curr)) { 
+        struct task_struct *curtask = task_of(curr); 
+ 
+        cpuacct_charge(curtask, delta_exec); 
+        account_group_exec_runtime(curtask, delta_exec); 
+    } 
+} 
+curr->exec_start表示上次tick中断时设置的时间戳,而rq->clock表示本次tick发生时的时间戳。二者相减,即为该进程自从上次tick以后的执行时间。从上面的代码中可以看到,流程转入到 __update_curr()。
+代码如下: 
+static inline void 
+__update_curr(struct cfs_rq *cfs_rq, struct sched_entity *curr, 
+          unsigned long delta_exec) 
+{ 
+    unsigned long delta_exec_weighted; 
+ 
+    /*schedstat_xxx函数都是在CONFIG_SCHEDSTATS条件下才有用,它用来统计进程执行的 
+     *相关信息 
+     */ 
+    schedstat_set(curr->exec_max, max((u64)delta_exec, curr->exec_max)); 
+ 
+    /*curr->sum_exec_runtime:总共的执行时间*/ 
+    curr->sum_exec_runtime += delta_exec; 
+    schedstat_add(cfs_rq, exec_clock, delta_exec); 
+    /*根据进程的nice中对delta_exec进行修正。nice越高。计算出来的delta_exec_weighted会越小*/ 
+    delta_exec_weighted = calc_delta_fair(delta_exec, curr); 
+    /*curr->vruntime:进程的执行时间。在rb_tree中根据此值进行排列*/ 
+    curr->vruntime += delta_exec_weighted; 
+    /*更新cfs_rq->min_vruntime,它近似等于rb_tree中最左侧节点的vruntime。 
+*实际情况是要比它稍微大一点。 
+*/ 
+    update_min_vruntime(cfs_rq); 
+} 
+这里出现了se->vruntime,简单的讲,它就是进程的执行时间,在调度的时候,它先选择执行时间短的进程进行调度。在后面所有的se都是存在rb_tree中的。键值为se->vruntime。也就是说,se->vruntime越高,就越靠近rb_tree的右边,而vruntime小的se都会位于左边。所以,在调度的时候,只需要取 rb_tree中最左的叶子结点即可。 
+ 
+以下是calc_delta_fair()的代码: 
+static inline unsigned long 
+calc_delta_fair(unsigned long delta, struct sched_entity *se) 
+{ 
+    /*NICE_0_LOAD: 优先级0 的weight*/ 
+    /* 如果不是优先级0,就要调用calc_delta_mine计算delta的weight值*/ 
+    if (unlikely(se->load。weight != NICE_0_LOAD)) 
+        delta = calc_delta_mine(delta, NICE_0_LOAD, &se->load); 
+ 
+    return delta; 
+} 
+该函数很简单,NICE_O_LOAD表示为优先级0的weight值,这样处理是因为,进程默认的优先级为0。所以在大部份情况,这个if都不会满足。 
+
+从这个函数中可以看到,如果进程的优先级为0,那么就是返回delta。如果不为0,就会调用calc_delta_mine()对delta值进行修正。对上面对calc_delta_mine()的说明来看,有如下关系: 
+Delta = delta* NICE_0_LOAD/ se->load 
+可以跟踪sys_nice(),就可以发现se->load其它就是表示nice对应的load值,nice越低,值越大。 
+据此,就可以得到一个结论。在执行相同时间的条件下(delta相同),高优先的进程计算出来的delta值会比低优先级的进程计算出来的低。应此,高优先的进程就会位于rb_tree的左边,在下次调度的时候就会优先调度。 
+ 
+到这里为止,已经分析完了update_curr()部分。返回到entity_tick()函数中,来分析下一个函数,即check_preempt_tick()。代码如下: 
+static void 
+check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr) 
+{ 
+    unsigned long ideal_runtime, delta_exec; 
+    
+    /*ideal_runtime: 应当要运行的时间*/ 
+    ideal_runtime = sched_slice(cfs_rq, curr); 
+    
+    /*delta_exec: 进程运行的时间*/ 
+    /*sum_exec_runtime: 进程执行的总时间*/ 
+    /*prev_sum_exec_runtime:进程在切换进CPU时的sum_exec_runtime值*/ 
+    delta_exec = curr->sum_exec_runtime - curr->prev_sum_exec_runtime; 
+    /*如果进程占用CPU时间超过了ideal_runtime。应该要调度进程了*/ 
+    if (delta_exec > ideal_runtime) 
+        resched_task(rq_of(cfs_rq)->curr); 
+} 
+对照代码中的注释,很好理解。delta_exec是在当前环境下进程允许执行的时间片大小,如果进程执行时间片超过了此值,就会调用resched_task()设置该进程的抢占位置,那么在tick中断返回用户空间的时候,就会调用schedule()来完成调度过程。 
+这个函数的难点是,ideal_runtime的计算由来,该值是由sched_slice()计算而来,代码如下: 
+static u64 sched_slice(struct cfs_rq *cfs_rq, struct sched_entity *se) 
+{ 
+    unsigned long nr_running = cfs_rq->nr_running; 
+ 
+    if (unlikely(!se->on_rq)) 
+        nr_running++; 
+ 
+    return calc_delta_weight(__sched_period(nr_running), se); 
+} 
+Nr_running是cfs_rq中运行进程数目。__sched_peiod()用来计算nr_running个进程调度一次的时间周期。它的代码如下: 
+static u64 __sched_period(unsigned long nr_running) 
+{ 
+    u64 period = sysctl_sched_latency; 
+    unsigned long nr_latency = sched_nr_latency; 
+ 
+    if (unlikely(nr_running > nr_latency)) { 
+        period = sysctl_sched_min_granularity; 
+        period *= nr_running; 
+    } 
+ 
+    return period; 
+} 
+从代码可看出,在nr_running小于nr_latency(5)的情况,它的值为sysctl_sched_latency(20ms)。否则为nr_running* sysctl_sched_min_granularity(4ms)。 
+ 
+返回到sched_slice()中,__sched_period()已经算出了nr_running个进程总的执行时间,那么当前进程又允许占用多长时间呢? 
+就这由calc_delta_weight()来计算了。代码如下: 
+static inline unsigned long 
+calc_delta_weight(unsigned long delta, struct sched_entity *se) 
+{ 
+    for_each_sched_entity(se) { 
+        /*根据cpu负载和nice计算所占的delta比重*/ 
+        delta = calc_delta_mine(delta, 
+                se->load。weight, &cfs_rq_of(se)->load); 
+    } 
+ 
+    return delta; 
+} 
+结合上面的分析: se->load表示进程nice对应的weight,cfs_rq->load表示该cfs_rq的负载,进程入列时,此值增加,进程出列时,此值减小。 
+再根据上面对calc_delta_mine()的描述,有如下关系: 
+Delta = delta* se->load。weight / cfs_rq->load 
+也就是说,系统负载越高,delta越小,nice越小,delta越高。 
+因此,就允许优先级的进程执行的时间片要长。系统负载越低,进程允许执行的时间片越长。 
+到这里,tick中断的处理就分析完了。 
+ 
+二: schedule()的执行过程 
+当进程需要被抢占或者是进程主运让出处理器,则会调用schedule()函数。该函数中调用模块的主要函数。如下示: 
+schedule()-> 
+sched_class->put_prev_task(rq,prev)-> 
+sched_class->pick_next_task() 
+ 
+对应到CFS中,put_prev_task()函数为put_prev_task_fair(),该操作就是将进程放回队列。代码如下示: 
+static void put_prev_task_fair(struct rq *rq, struct task_struct *prev) 
+{ 
+    struct sched_entity *se = &prev->se; 
+    struct cfs_rq *cfs_rq; 
+ 
+    for_each_sched_entity(se) { 
+        cfs_rq = cfs_rq_of(se); 
+        put_prev_entity(cfs_rq, se); 
+    } 
+} 
+流程转入到put_prev_entity()中,它的代码如下: 
+static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev) 
+{ 
+    /* 
+     * If still on the runqueue then deactivate_task() 
+     * was not called and update_curr() has to be done: 
+     */ 
+     /*如果prev在runqueue中。更新它的相关信息*/ 
+    if (prev->on_rq) 
+        update_curr(cfs_rq); 
+    
+    /*DEBUG用*/ 
+    check_spread(cfs_rq, prev); 
+    if (prev->on_rq) { 
+        /*更新prev的wait_start*/ 
+        update_stats_wait_start(cfs_rq, prev); 
+        /* Put 'current' back into the tree。 */ 
+        /*将prev放回rb_tree*/ 
+        __enqueue_entity(cfs_rq, prev); 
+    } 
+    /*将cfs_rq->curr置空。因为它已经放入了rb_tree中*/ 
+    cfs_rq->curr = NULL; 
+} 
+在这里需要注意的是,只是进程在cfs_rq中,也就是prev->on_rq为1的时候,才需要将进程入列,这是因为在进程主动调用schedule()的时候,会调用deactivate_task()将task移出队列。 
+
+__enqueue_entity()。代码如下: 
+static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se) 
+{ 
+    /*cfs_rq的rb_tree*/ 
+    struct rb_node **link = &cfs_rq->tasks_timeline。rb_node; 
+    struct rb_node *parent = NULL; 
+    struct sched_entity *entry; 
+    /*排序的key。 为se->vruntime - cfs_rq->min_vruntime*/ 
+    s64 key = entity_key(cfs_rq, se); 
+    int leftmost = 1; 
+ 
+    /* 
+     * Find the right place in the rbtree: 
+     */ 
+     /*将se 以key为键值存放到rb_tree中*/ 
+    while (*link) { 
+        parent = *link; 
+        entry = rb_entry(parent, struct sched_entity, run_node); 
+        /* 
+         * We dont care about collisions。 Nodes with 
+         * the same key stay together。 
+         */ 
+         /*如果key要小于当前节点,往左移*/ 
+        if (key < entity_key(cfs_rq, entry)) { 
+            link = &parent->rb_left; 
+        } 
+        /*否则往右移。se已经往右移动了,不可能位于最左边了,因此将leftmost置0*/ 
+        else { 
+            link = &parent->rb_right; 
+            leftmost = 0; 
+        } 
+    } 
+ 
+    /* 
+     * Maintain a cache of leftmost tree entries (it is frequently 
+     * used): 
+     */ 
+     /*如果新加入的结点位于最左端,更新cfs_rq->rb_leftmost 
+     *cfs_rq->rb_leftmost起优先作用,这样调度器在找最小key值结点的时候就不用 
+     *遍历整个rb_tree了。只需直接取cfs_rq->rb_leftmost就可以了 
+     */ 
+    if (leftmost) 
+        cfs_rq->rb_leftmost = &se->run_node; 
+ 
+    /*插入红黑树。设置结点颜色*/ 
+    rb_link_node(&se->run_node, parent, link); 
+    rb_insert_color(&se->run_node, &cfs_rq->tasks_timeline); 
+} 
+这段代码就是将se存入rb_tree
+。 
+在上面的代码中可以看到,rb_tree的key为se->vruntime- cfs_rq->min_vruntime。这里se->vruntime本身就表示进程的执行”时间”。 
+到这里,CFS的put_prev_task()操作就已经完成了。
+接下来分析schedule()的另外一个操作,即pick_next_task()操作,该操作是用来选择下一个被调度的进程。代码如下: 
+ 
+static struct task_struct *pick_next_task_fair(struct rq *rq) 
+{ 
+    struct task_struct *p; 
+    struct cfs_rq *cfs_rq = &rq->cfs; 
+    struct sched_entity *se; 
+ 
+    /*如果cfs_rq中已经没有要调度的进程了*/ 
+    if (unlikely(!cfs_rq->nr_running)) 
+        return NULL; 
+ 
+    do { 
+        /*选择出下一个要调度的进程*/ 
+        se = pick_next_entity(cfs_rq); 
+        /*设置选择了的进程的相关信息*/ 
+        set_next_entity(cfs_rq, se); 
+        cfs_rq = group_cfs_rq(se); 
+    } while (cfs_rq); 
+ 
+    p = task_of(se); 
+    hrtick_start_fair(rq, p); 
+ 
+    return p; 
+} 
+在没有配置组调度选项(CONFIG_FAIR_GROUP_SCHED)的情况下。group_cfs_rq()返回NULL。因此,上函数中的循环只会循环一次。 
+该函数中有两个重要的子函数,一个是pick_next_entity()。另一个是set_next_entity()。先来分析pick_next_entity()。代码如下: 
+static struct sched_entity *pick_next_entity(struct cfs_rq *cfs_rq) 
+{ 
+    /*选择RB_TREE中最左端的结点*/ 
+    struct sched_entity *se = __pick_next_entity(cfs_rq); 
+ 
+    /*因为cfs_rq->next有可能不在RB_tree中,因此,要判断从rb_tree中取出的结点是否能 
+    *满足调度的条件 
+    */ 
+    
+    /*判断是否会被cfs_rq->next抢占*/ 
+    if (cfs_rq->next && wakeup_preempt_entity(cfs_rq->next, se) < 1) 
+        return cfs_rq->next; 
+    /*判断是否会被cfs_rq->last抢占*/ 
+    if (cfs_rq->last && wakeup_preempt_entity(cfs_rq->last, se) < 1) 
+        return cfs_rq->last; 
+ 
+    return se; 
+} 
+ 
+跟踪wakeup_preempt_entity()的代码，如下示: 
+/* 
+ * Should 'se' preempt 'curr'。 
+ * 
+ *             |s1 
+ *        |s2 
+ *   |s3 
+ *         g 
+ *      |<--->|c 
+ * 
+ *  w(c, s1) = -1 
+ *  w(c, s2) =  0 
+ *  w(c, s3) =  1 
+ * 
+ */ 
+ /*如果小于1,则se不可抢占curr*/ 
+static int 
+wakeup_preempt_entity(struct sched_entity *curr, struct sched_entity *se) 
+{ 
+    s64 gran, vdiff = curr->vruntime - se->vruntime; 
+ 
+    /*如果se->vruntime 大于/等于curr->vruntime。不可抢占*/ 
+    if (vdiff <= 0) 
+        return -1; 
+ 
+    /*运行到这里,属于se->vruntime小于curr->vruntime的情况*/ 
+ 
+    /*如果超过了它的调度粒度。se可以抢占curr*/ 
+    gran = wakeup_gran(curr); 
+    if (vdiff > gran) 
+        return 1; 
+    /*如果小于调度粒度,不可抢占*/ 
+    return 0; 
+} 
+
+注释的意思是是： 
+横坐标是vruntime值，向右逐渐增大。c = current。g = c的最小调度颗粒，也就是理论上最短占有CPU的时间。 s1与c比较vruntime，发现s1的vruntime比c大或者相等，根据cfs调度器的原理，s1自然不能抢占c，所以返回-1;s2与c比较 vruntime，发现s2的vruntime比c小，但是这个时候必须要考虑最小调度颗粒的问题，避免频繁调度，浪费CPU时间。这个可能比较难理解。打个比方：一个机器触发调度的点很多，也就是说可能在很短时间内很频繁的检查当前进程需不需要被切换，假如 10ns检查一次，而s2与c的vruntime相差很小，每次检查时就发现c的vruntime刚好超过s2的vruntime，如果不考虑最小调度颗粒的问题，s2 就要抢占 c 的CPU。可是10 ns之后 s2的vruntime刚好超过c的 vruntime，于是又进行一次切换。如此，s2和c就在不停的互相切换，浪费CPU时间。这种情况就必须考虑最小调度颗粒，让 wake_up_preempt_entity()返回0。s3与c比较vruntime，发现s3的vruntime比c小，而且幅度超过c的最小调度颗粒，说明c已经运行足够长的时间了，可以进行切换，返回1
+Miao Xie老师的指点说的已经够详细了,在这里就不再做过多的解释了。 
+ 
+回到pick_next_task_fair()中,来看下一个子函数,即set_next_entity()。代码如下: 
+static void 
+set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se) 
+{ 
+    /*如果se已经在运行队列中,将其出列*/ 
+    /* 'current' is not kept within the tree。 */ 
+    if (se->on_rq) { 
+        /* 
+         * Any task has to be enqueued before it get to execute on 
+         * a CPU。 So account for the time it spent waiting on the 
+         * runqueue。 
+         */ 
+         /*选择编译函数*/ 
+        update_stats_wait_end(cfs_rq, se); 
+        /*将se从rb_tree中移出*/ 
+        __dequeue_entity(cfs_rq, se); 
+    } 
+    /*更新se的开始执行时间。即se->exec_start*/ 
+    update_stats_curr_start(cfs_rq, se); 
+    /*更新cfs_rq->curr,即cfs_rq上当前执行的的进程为se所表示的进程*/ 
+    cfs_rq->curr = se; 
+#ifdef CONFIG_SCHEDSTATS 
+    /* 
+     * Track our maximum slice length, if the CPU's load is at 
+     * least twice that of our own weight (i。e。 dont track it 
+     * when there are only lesser-weight tasks around): 
+     */ 
+    if (rq_of(cfs_rq)->load。weight >= 2*se->load。weight) { 
+        se->slice_max = max(se->slice_max, 
+            se->sum_exec_runtime - se->prev_sum_exec_runtime); 
+    } 
+#endif 
+    /*更新se->prev_sum_exec_runtime为进程切换进CPU的sum_exec_runtime*/ 
+    se->prev_sum_exec_runtime = se->sum_exec_runtime; 
+} 
+现在已经找到要调度的se了,如果该se还处于运行队列中,那么将其移出rb_tree,在这里可以看到: 当前运行的se是不在rb_tre,在这里要特别注意的是,虽然se被移出了rb_tree,但se->on_rq仍然为1,表示可调度的。并且更新cfs_rq上当前执行的进程指向,然后,再更新se->prev_sum_exec_runtime。它表示进程被切换上CPU时的进程执行总时间,在每个tick中,就会更新se->sum_exec_runtime,即总的执行时间。因此se->sum- exec_runtime - se->prev_sum_exec_runtime就计算出了,进程运行的时间片,可以参考前面对check_preempt_tick()函数的分析。 
+到这里为止,schedule()的执行过程已经分析完毕。 
+ 
+三:新进程的调度过程 
+在创建新进程的时候,在do_fork()中有如下过程: 
+long do_fork(unsigned long clone_flags, 
+          unsigned long stack_start, 
+          struct pt_regs *regs, 
+          unsigned long stack_size, 
+          int __user *parent_tidptr, 
+          int __user *child_tidptr) 
+{ 
+    ．．．．．． 
+    ．．．．．． 
+if (unlikely(clone_flags & CLONE_STOPPED)) { 
+            /* 
+             * We'll start up with an immediate SIGSTOP。 
+             */ 
+            sigaddset(&p->pending。signal, SIGSTOP); 
+            set_tsk_thread_flag(p, TIF_SIGPENDING); 
+            __set_task_state(p, TASK_STOPPED); 
+        } else { 
+            wake_up_new_task(p, clone_flags); 
+        } 
+    ．．．．．． 
+    ．．．．．． 
+｝ 
+即在末带CLONE_STOPPED标志创建进程时,就会对新进程调用wake_up_new_task()。代码如下: 
+void wake_up_new_task(struct task_struct *p, unsigned long clone_flags) 
+{ 
+    unsigned long flags; 
+    struct rq *rq; 
+ 
+    /*进程所在的rq。并加锁*/ 
+    rq = task_rq_lock(p, &flags); 
+    /*如果进程不为TASK_RUNNING状态,BUG*/ 
+    BUG_ON(p->state != TASK_RUNNING); 
+    /*更新rq->clock*/ 
+    update_rq_clock(rq); 
+ 
+    /*计算有效优先级,如果为一般进程,就是其static_prio*/ 
+    p->prio = effective_prio(p); 
+ 
+    /*如果调度器没有task_new操作。或者当前进程已经被移出运行队列了*/ 
+    if (!p->sched_class->task_new || !current->se。on_rq) { 
+        activate_task(rq, p, 0); 
+    } else { 
+        /* 
+         * Let the scheduling class do new task startup 
+         * management (if any): 
+         */ 
+        p->sched_class->task_new(rq, p); 
+        inc_nr_running(rq); 
+    } 
+    trace_sched_wakeup_new(rq, p); 
+    /*检查其是否可以抢点当前进程。如果是,设置抢占标志*/ 
+    check_preempt_curr(rq, p, 0); 
+#ifdef CONFIG_SMP 
+    if (p->sched_class->task_wake_up) 
+        p->sched_class->task_wake_up(rq, p); 
+#endif 
+    /*unlock rq*/ 
+    task_rq_unlock(rq, &flags); 
+} 
+这个函数比较简单,如果被新进程所属调度器的task_new()为空或者当前进程已经被移出运行队了,就直接调用activate_task()将新进程放入运行队列。否则调用调度器的task_new()函数。或许有人觉得对 current->se。on_rq判断有点迷糊,current不是正在运行的进程么?怎么会不在运行队列中呢?很简单,有一种情况,SMP中, 一上CPU对另一个CPU上运行进程执行了dequeue_task()的操作。 
+Activate_task()代码很简单,这里就不详细分析了,我们接下来看一下CFS的task_new操作,它的对应接口为: task_new_fair()。代码如下: 
+static void task_new_fair(struct rq *rq, struct task_struct *p) 
+{ 
+    struct cfs_rq *cfs_rq = task_cfs_rq(p); 
+    struct sched_entity *se = &p->se, *curr = cfs_rq->curr; 
+    int this_cpu = smp_processor_id(); 
+ 
+    /*选择编译函数*/ 
+    sched_info_queued(p); 
+    /*更新cfs_rq的信息*/ 
+    update_curr(cfs_rq); 
+    /*对se(即新进程)的的vruntime进行调整*/ 
+    place_entity(cfs_rq, se, 1); 
+ 
+    /* 'curr' will be NULL if the child belongs to a different group */ 
+    /*如果sysctl_sched_child_runs_first即强制子进程先于父进程先运行 
+    *所以,如果子进程的vruntime大于父进程的vruntime的时候,父互两者的vruntime值 
+    *并设置强制抢占,这样就要以强制使子进程先于父进程而运行*/ 
+    if (sysctl_sched_child_runs_first && this_cpu == task_cpu(p) && 
+            curr && curr->vruntime < se->vruntime) { 
+        /* 
+         * Upon rescheduling, sched_class::put_prev_task() will place 
+         * 'current' within the tree based on its new key value。 
+         */ 
+        swap(curr->vruntime, se->vruntime); 
+        resched_task(rq->curr); 
+    } 
+ 
+    enqueue_task_fair(rq, p, 0); 
+} 
+首先来看一下怎样对进程的vruntime进行调整。这是在place_entity()中进行的,代码如下: 
+static void 
+place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial) 
+{ 
+    u64 vruntime = cfs_rq->min_vruntime; 
+ 
+    /* 
+     * The 'current' period is already promised to the current tasks, 
+     * however the extra weight of the new task will slow them down a 
+     * little, place the new task so that it fits in the slot that 
+     * stays open at the end。 
+     */ 
+     /*sched_vslice():将进程的最大运行时间片转换为vruntime。*/ 
+    if (initial && sched_feat(START_DEBIT)) 
+        vruntime += sched_vslice(cfs_rq, se); 
+ 
+    if (!initial) { 
+        /* sleeps upto a single latency don't count。 */ 
+        if (sched_feat(NEW_FAIR_SLEEPERS)) { 
+            unsigned long thresh = sysctl_sched_latency; 
+ 
+            /* 
+             * convert the sleeper threshold into virtual time 
+             */ 
+            if (sched_feat(NORMALIZED_SLEEPER)) 
+                thresh = calc_delta_fair(thresh, se); 
+ 
+            vruntime -= thresh; 
+        } 
+ 
+        /* ensure we never gain time by being placed backwards。 */ 
+        /*不能小于se->vruntime,即不能使它的vruntime值变得比现在还要小*/ 
+        vruntime = max_vruntime(se->vruntime, vruntime); 
+    } 
+ 
+    se->vruntime = vruntime; 
+} 
+首先,这个函数有一个initial参数,这是为了区别两种不同情况下的vruntime调整,一种情况是新创建进程的情况,也就是在上面所分析的情况,它的initial值为1。另外一种情况是唤醒一个进程时的vruntime调整。为了便于后面对唤醒过程的分析,在这里分析这个函数的时候针对这两种情况做一个讲解。 
+在第一种情况下,新创建的进程都以cfs_rq->min_vruntime都为一个基础,在其后的一段时间后得到调度。这段时间的大小为sched_vslice(),它其实就是将sched_slice()转换为虚拟运行时间。 
+在第二种情况下,是调整唤醒进程的vruntime值,这种情况比较复杂。 
+首先,为什么要对唤醒进程的时间进行调整呢?我们来考虑一个这样的问题: 
+假设进程A睡眠了较长时间,以后被唤醒,如果没有调整其vruntime值,就会使得其vruntime远小于cfs_rq->min_vruntime。这样的后果就是,在其后相当长的一段时间内,进程A都会独占CPU,造成了其它进程不能及时得到响应。 
+如何调整，有以下两个情况: 
+1):如果进程睡眠的时间很短,也就是se->vruntime仍然大于cfs_rq->min_vruntime。这种情况下,不需要对se->vruntime进程调整。 
+2):如果进程睡眠时间较长,那当然要对睡眠进程的时间做一个补偿,因此,就将cfs_rq->min_vruntime适当减一个差值做为进程的vruntime值,当然,这种情况下,不能使调整之后的值比之前的vruntime还要小。 
+结合上面的分析,应该很容易理解这个函数了,接下来,返回到task_new_fair(),来分析它的下一个子函数, enqueue_task_fair()。它的代码如下: 
+static void enqueue_task_fair(struct rq *rq, struct task_struct *p, int wakeup) 
+{ 
+    struct cfs_rq *cfs_rq; 
+    struct sched_entity *se = &p->se; 
+ 
+    for_each_sched_entity(se) { 
+        if (se->on_rq) 
+            break; 
+        cfs_rq = cfs_rq_of(se); 
+        enqueue_entity(cfs_rq, se, wakeup); 
+        wakeup = 1; 
+    } 
+ 
+    hrtick_update(rq); 
+} 
+现在,新进程的vruntime已经调整好了,是到将它加入到运行队列的时候了,enqueue_task_fair()就是完成这样的工作。 
+注意这个函数的wakeup参数,它来有标识,是不是在唤醒进程的条件下调用enqueue_task_fair()。区分这样的情况,是因为在之后还要调整唤醒进程的vruntime值。 
+在这里的情况是创建的一个新进程,因此在task_new_fair()中调用这个函数的wakeup参数为0。 
+流程接着转入到了enqueue_entity()中,代码如下: 
+static void 
+enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int wakeup) 
+{ 
+    /* 
+     * Update run-time statistics of the 'current'。 
+     */ 
+     /*更新当前信息*/ 
+    update_curr(cfs_rq); 
+    /*计算cfs_rq的负载和运行进程数目并且将se->on_rq置为1,表示该进程 
+     *已经处于运行队列中了 
+     */ 
+    account_entity_enqueue(cfs_rq, se); 
+ 
+    /*如果是因为唤醒而入列,调用place_entity()来调整其vruntime值*/ 
+    if (wakeup) { 
+        place_entity(cfs_rq, se, 0); 
+        enqueue_sleeper(cfs_rq, se); 
+    } 
+ 
+    update_stats_enqueue(cfs_rq, se); 
+    check_spread(cfs_rq, se); 
+    /*如果se不是当前运行进程,加其入列。(当前运行的进程是没有在 
+     *rb_tree中的) 
+     */ 
+    if (se != cfs_rq->curr) 
+        __enqueue_entity(cfs_rq, se); 
+} 
+
+
+account_entity_enqueue()的代码如下: 
+static void 
+account_entity_enqueue(struct cfs_rq *cfs_rq, struct sched_entity *se) 
+{ 
+    /*增加cfs_rq的负载(load)*/ 
+    update_load_add(&cfs_rq->load, se->load。weight); 
+    /*增加run queue的负载*/ 
+    if (!parent_entity(se)) 
+        inc_cpu_load(rq_of(cfs_rq), se->load。weight); 
+    /*涉及到CONFIG_FAIR_GROUP_SCHED*/ 
+    if (entity_is_task(se)) { 
+        add_cfs_task_weight(cfs_rq, se->load。weight); 
+        list_add(&se->group_node, &cfs_rq->tasks); 
+    } 
+    /*递增运行进程数目*/ 
+    cfs_rq->nr_running++; 
+    /*置se->on_rq为1*/ 
+    se->on_rq = 1; 
+} 
+通过这个函数可以看到cfs_rq->load的改变。一般来说,有进程入列,就会增加cfs_rq->load,即负载加大,有进程出列,就会减小cfs_rq->load,即负载变小。 
+ 
+返回到wake_up_new_task(),来接着分析下一个重要子函数check_preempt_curr()。
+代码如下: 
+static inline void check_preempt_curr(struct rq *rq, struct task_struct *p, int sync) 
+{ 
+    rq->curr->sched_class->check_preempt_curr(rq, p, sync); 
+} 
+在CFS中,该操作会指向check_preemt_wakeup(): 
+static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int sync) 
+{ 
+    struct task_struct *curr = rq->curr; 
+    struct sched_entity *se = &curr->se, *pse = &p->se; 
+ 
+    /*如果是实时进程*/ 
+    if (unlikely(rt_prio(p->prio))) { 
+        struct cfs_rq *cfs_rq = task_cfs_rq(curr); 
+ 
+        update_rq_clock(rq); 
+        update_curr(cfs_rq); 
+        resched_task(curr); 
+        return; 
+    } 
+ 
+    /*如果不属于CFS调度*/ 
+    if (unlikely(p->sched_class != &fair_sched_class)) 
+        return; 
+ 
+    /*要唤醒的进程和当前运行的进程是同一个*/ 
+    if (unlikely(se == pse)) 
+        return; 
+ 
+    /* 
+     * Only set the backward buddy when the current task is still on the 
+     * rq。 This can happen when a wakeup gets interleaved with schedule on 
+     * the ->pre_schedule() or idle_balance() point, either of which can 
+     * drop the rq lock。 
+     * 
+     * Also, during early boot the idle thread is in the fair class, for 
+     * obvious reasons its a bad idea to schedule back to the idle thread。 
+     */ 
+     /*设置cfs_rq->last*/ 
+    if (sched_feat(LAST_BUDDY) && likely(se->on_rq && curr != rq->idle)) 
+        set_last_buddy(se); 
+    /*设置cfs_rq->next*/ 
+    set_next_buddy(pse); 
+ 
+    /* 
+     * We can come here with TIF_NEED_RESCHED already set from new task 
+     * wake up path。 
+     */ 
+     /*如果已经设置了抢占标志,返回*/ 
+    if (test_tsk_need_resched(curr)) 
+        return; 
+ 
+    /* 
+     * Batch tasks do not preempt (their preemption is driven by 
+     * the tick): 
+     */ 
+     /*如果是属于SCHED_BATCH 的进程,返回*/ 
+    if (unlikely(p->policy == SCHED_BATCH)) 
+        return; 
+    /*如果不允许在唤醒时抢占(该值可以使用sysctl配置),返回*/ 
+    if (!sched_feat(WAKEUP_PREEMPT)) 
+        return; 
+ 
+    /*接下来,主要判断唤醒进程能否抢占当前进程*/ 
+    if (sched_feat(WAKEUP_OVERLAP) && (sync || 
+            (se->avg_overlap < sysctl_sched_migration_cost && 
+             pse->avg_overlap < sysctl_sched_migration_cost))) { 
+        resched_task(curr); 
+        return; 
+    } 
+ 
+    find_matching_se(&se, &pse); 
+ 
+    while (se) { 
+        BUG_ON(!pse); 
+ 
+        if (wakeup_preempt_entity(se, pse) == 1) { 
+            resched_task(curr); 
+            break; 
+        } 
+ 
+        se = parent_entity(se); 
+        pse = parent_entity(pse); 
+    } 
+} 
+需要指出的是,在这里,会调用set_last_buddy()和set_next_buddy()来设置 cfs_rq->last和cfs_rq->next。这也就是在schedule()过程分析中遇到的,在这里可以看到,cfs_rq->last指向当前运行进程,而cfs_rq->next指向要插入的进程。在schedule()调度的时候,会优先让这两个进程运行。check。同样,这个操作在进程的唤醒也存中,见接下来的分析: 
+ 
+四:进程的唤醒 
+以try_to_wake_up()为例来分析进程的唤醒过程,代码片段如下: 
+static int try_to_wake_up(struct task_struct *p, unsigned int state, int sync) 
+{ 
+    ．．．．．． 
+    ．．．．．． 
+    activate_task(rq, p, 1); 
+    success = 1; 
+ 
+out_running: 
+    trace_sched_wakeup(rq, p); 
+    check_preempt_curr(rq, p, sync); 
+ 
+    p->state = TASK_RUNNING; 
+    ．．．．．． 
+    ．．．．．． 
+｝ 
+在这里需要注意一个参数，即sync, 如果sync等于1,则表示唤醒的进程不能够抢占当前CPU上运行的进程。 
+Activate_task()的代码很简单,它的核心操作是以1为参数调用enqueue_task()。即会调用进程的vruntime值并且入列。在这里就不做过多分析。接下来它也会调用check_preempt_curr()。
+ 
+五:关于cfs_rq->next和cfs_rq->last 
+搜索2.6.28的源代码,发现只有在进程dequeue_task()的时候才会调用clear_buddies()将cfs_rq->next和cfs_rq->last的指向清空,即变为NULL。 
+那假设有这样的情况: 
+从进程A中唤醒进程B,根据之前的分析,就有cfs_rq->last = A。se ,cfs_rq->next = b。se。那只要以后没有操作去更改cfs_rq->last和cfs_rq->next且A,B没有退出,就会一直保持A,B的优先调度。 而实际上在唤醒操作完成之后,这个优先调度的过程是不需要的。这样或多或少会造成性能上的损失。 
+
+小结：由于是初学者，很多东西都不了解，这个作业（好像是最复杂的一个）我是找了很多参考资料，借鉴了很多人写的代码分析内容，虽然很多不是自己的成果，但是通过这一次作业我也学到了很多有关linux内核的知识，也算是受益匪浅。 
